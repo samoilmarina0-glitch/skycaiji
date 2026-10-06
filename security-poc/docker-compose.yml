@@ -1,0 +1,40 @@
+# SkyCaiji 未认证 0-click SSRF → 云元数据 → 临时 AK/SK 泄漏  复现环境
+# 用法见 security-poc/README.md
+services:
+  db:
+    image: mysql:5.7
+    container_name: sc-db
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: skycaiji
+    networks: [scnet]
+
+  # 模拟云厂商元数据服务 / 内网服务（攻击者正常无法直接访问，只有服务端能访问）
+  # 返回伪造的 STS 临时凭证（AccessKeyId / AccessKeySecret / SecurityToken）
+  meta:
+    image: php:7.4-cli
+    container_name: sc-meta
+    working_dir: /app
+    volumes:
+      - ./meta:/app:ro
+    command: php -S 0.0.0.0:80 router.php
+    networks:
+      scnet:
+        aliases:
+          # 用别名模拟真实元数据主机名（仅演示；真实环境是 100.100.100.200 / 169.254.169.254）
+          - metadata.internal
+
+  app:
+    build:
+      context: ..
+      dockerfile: security-poc/app.Dockerfile
+    container_name: sc-app
+    depends_on: [db, meta]
+    ports:
+      - "8899:80"
+    networks: [scnet]
+
+networks:
+  scnet:
+    driver: bridge
