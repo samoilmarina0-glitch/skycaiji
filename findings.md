@@ -109,3 +109,29 @@
 
 ## 已覆盖维度
 (建设中)
+
+---
+# 第二轮「升级」审计（Workflow, 8 维度 → 对抗验证）—— 目标: 超越临时STS的持久化影响
+
+## ★ V4 [Critical, 已实弹复现] 未认证 → 文件本地化任意 .php 落盘 → webshell/RCE → 永久凭据
+- 入口同 V1(未认证单页采集 admin/api/single)，但走**文件本地化(download_file)**后置流水线 → 持久化 RCE。
+- 数据流: input('url')(CpatternSingle.php:19) → dvalue 整页(CollectCommon.php:2663) → is_file 正则提取裸URL入 field['file'](CollectCommon.php:2002-2011) → 发布 get_field_val→download_file(ReleaseBase.php:154-182) → 后缀无白名单(Funcs.php:474, ReleaseBase.php:688-690) → write_dir_file data/files/<date>/<md5>.php(ReleaseBase.php:782, common.php:107)。
+- 可执行: data/files/ 无 .htaccess(对比 data/program/.htaccess=deny)；根 .htaccess `!-f` → 已存在 .php 直接交 Apache 执行。路径=md5(文件URL)可预测。
+- 前置(运营者配置, 均现实可见): pattern单页(open=1,key='') + download_file开 + 字段 download/is_file 处理步 + 非api发布模块。
+- **实弹**: GET /index.php/api_single/1?url=http://metadata.internal/p → 落 data/files/2026-10-07/711d03aae2b9484044705730ea25be62.php；GET 该php?c=id → uid=33(www-data)；?c=cat .../data/config.php → DB root 账密；再用其读 config 表 translate/email/proxy 永久密钥。
+- 复现: security-poc/run-rce.sh (compose up 后一键)。
+- 对抗验证: 3/3 (reachability/dataflow/impact 全 CONFIRMED, 影响超越临时STS)。
+
+## 第二轮其余发现(源码已确认 / 待复验)
+- [源码确认] util/Curl 无 CURLOPT_PROTOCOLS/REDIR_PROTOCOLS + FOLLOWLOCATION=1(Curl.php:87-94) → 未认证可发任意libcurl协议打内网(gopher→Redis/FastCGI盲写); 非HTTP因get_html以200判成功而盲。
+- [源码确认] admin/api/task 密钥绕过: elseif($apiKey==md5($apiConfig['key']))(Api.php:35), 任务api发布空密钥时发 md5('')=d41d8cd9… 绕过 → 未认证触发任务自身采集+发布(URL非攻击者直控)。中危。
+- [待复验] 单页采集DB异常message回显→泄漏库名/表前缀/列名/DB用户@主机(不含口令)。
+- [待复验] find_password 泄漏表前缀+已知口令skycaiji123的有效hash+(邮件失败)SMTP主机/账号; 不泄漏当前hash/salt→不足以伪造cookie。
+- [待复验] Rfile 实时发布写 data/ 可控文件(扩展名限txt/xls/xlsx); Rdb/Rcms/Rdatahub/Rdataset 下游内容注入。
+- [待复验] Rdiy(type=code) eval 管理员PHP, 攻击者可控$url/$fields入eval作用域(条件RCE放大器)。
+- [待复验] 二次入库: 单页采集→dataset/datahub→api/data读回, 构成通用未认证内网HTTP响应读取原语。
+- [源码确认-当前不可利用] ApiApp _op_variable_func call_user_func_array 无白名单, 但函数名由插件_ops定义非外部可控且无内置插件。
+
+## 定级修正
+- 头号漏洞由 V1(临时STS) 升级为 **V4(持久化RCE→永久凭据)**。V1 降为并列Critical但影响短效。
+- 注: 第二轮对抗验证阶段因会话速率限制中断(34 agent失败), "待复验"项为finder已完成、我已核对关键断言但未独立对抗复核者; V4 已完成3/3验证+实弹。
