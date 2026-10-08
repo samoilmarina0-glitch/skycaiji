@@ -2,7 +2,8 @@
 
 - 目标：发现**未认证、0-click、可泄漏 AK/SK** 的漏洞，并以 Docker 复现。
 - 被审对象：本仓库 SkyCaiji `v3.1`（应用代码 `vendor/skycaiji/app/`，框架为定制版 ThinkPHP 5.0.x，`THINK_VERSION='1.2 skycaiji'`）。
-- 方法：以「事实/意图」图驱动的状态空间搜索，正向+反向污点；两轮并行多代理审计（第一轮 4 维度：SQLi/SSRF/框架 n-day/机密直泄·反序列化·install；第二轮 8 维度「升级」审计：把未认证入口升级为 RCE/文件写/永久机密），每条发现经对抗性验证。全部结论以本仓库实际源码为准并主动寻找反证。
+- 方法：以「事实/意图」图驱动的状态空间搜索，正向+反向污点；三轮并行多代理审计（R1 4 维度：SQLi/SSRF/框架 n-day/机密直泄·反序列化·install；R2 8 维度「升级」：把未认证入口升级为 RCE/文件写/永久机密；R3 3 维度「无条件可达」专项：默认零配置实例是否可无条件泄漏云 AK/SK），每条发现经对抗性验证 + 手工源码复核。全部结论以本仓库实际源码为准并主动寻找反证。
+- **无条件可达结论（R3）**：默认全新安装上**不存在**无条件未认证云 AK/SK 泄漏（逐条证伪见「四之二」）；可触及云 AK/SK 的未认证路径（V1/V4）均需运营者先启用单页采集/文件本地化功能。
 - 结论：确认 **2 个 Critical 未认证漏洞**，均已 Docker 实弹复现：
   - **V4（头号，持久化）**：未认证 0-click → 文件本地化任意 `.php` 落盘 → **webshell/RCE** → 读取**永久**数据库账密与 config 表全部永久密钥。
   - **V1**：未认证 0-click SSRF → 云元数据 → 临时 STS AK/SK（短效）。
@@ -19,6 +20,8 @@
 | **V1** | **Critical** | 未认证 SSRF → 云元数据 → **临时** STS AK/SK | 未认证 / 0-click（需开启单页采集且空密钥） | `admin/controller/Api.php:67` → `admin/event/CpatternSingle.php:19` | ✅ 实弹 |
 | V2 | Medium | 认证绕过（`admin/index/*`、`admin/api/*` 免登录） | 未认证 | `admin/behavior/Init.php:95`、`admin/controller/BaseController.php:20` | ✅ 实弹 |
 | V3 | High（仅未安装态） | 安装期 `config.php` PHP 代码注入 → RCE | 未认证（目标处于未安装态时） | `install/controller/Index.php:179-187` | 源码确认 |
+| V5 | Medium | authsign 鉴权绕过（默认空 store 密钥，**无条件**）→ store_update/certificate | 未认证 / **无条件** | `admin/model/Provider.php:102,150`、`admin/controller/Api.php:237,252` | 源码确认 |
+| V6 | Low | runtime/、data/ 缺 deny `.htaccess` → 运行时日志 web 可直读（**无条件**，不含 AK/SK） | 未认证 / **无条件** | 根 `.htaccess`；`runtime/log/` 无防护 | 源码确认 |
 
 > 下文路径中的 `app/` 均指 `vendor/skycaiji/app/`。V4/V1 共享同一未认证入口（单页采集），区别在于后置流水线：V4 走「文件本地化下载→落盘」得到持久化 RCE，V1 走「字段回显」得到一次性内网响应。
 
@@ -206,6 +209,29 @@ GET /index.php/api_single/1?url=http://100.100.100.200/latest/meta-data/ram/secu
 | ssti-expr | 变量函数/`ApiApp` `_op_variable_func` 用 `call_user_func_array` 调任意 PHP 函数且无白名单，但函数名由插件 `_ops` 定义、非外部可控且无内置插件 → 当前不可直接注入 | Low | 否(当前) | 源码已确认(当前不可利用) |
 
 > 说明：第二轮共 14 条原始发现，经对抗验证存活并影响超越临时 STS 的为 **V4**。上表其余条目中，"源码已确认"项我已逐行核对关键断言成立；"待复验"项为 finder 阶段已完成但对抗验证阶段被速率限制中断、尚未独立复核——列出以供回归，不计入最终定级。
+
+---
+
+## 四之二、第三轮：「无条件可达」专项（结论：默认实例不存在无条件未认证云 AK/SK 泄漏）
+
+> 问题：是否存在**无条件**（默认全新安装、零运营者配置、无预置任务）的未认证路径泄漏云 AK/SK？
+> 结论：**不存在**。默认安装仅种入 config 的 `version/caiji/site`，无任何 task/dataapi/云凭据；所有"无条件"未认证原语均为无害死胡同，所有能触及 AK/SK 的路径都需运营者先启用某功能（V1/V4 的单页采集任务、store 插件表导入、或登录）。以下为新确认的无条件原语与逐条证伪留痕。
+
+### 新确认的无条件未认证原语（但均不泄漏 AK/SK）
+- **V5【Medium】authsign 鉴权绕过（无条件）**：`admin/api/store_update`、`certificate` 依赖 `Provider::storeAuthResult`(`admin/model/Provider.php:150`)。全新安装 `store` 配置为空 → `getAuthkey(null)=''`(`Provider.php:74-87`) → `createAuthsign`(`Provider.php:102-112`) 的 authkey 分量为 `''`，其余分量 `client_domain`=受害者自身 host（`config('root_website')` 由 Host 头决定，`config.php:247`）、`store_domain`=攻击者传入 `store_url`、`timestamp`=攻击者选取（`now±1000s`）→ **authsign 完全可伪造**；`store_url=https://www.skycaiji.com` 过 `is_official_url`（`allow_origins`，`config.php:253`）。→ storeAuthResult 返回成功、`provider_id=0`。**解锁的动作仅回显非机密元数据**：`store_update`(`Api.php:262-298`) 三个分支分别 `Rule->...->column('uptime','store_id')`、`ReleaseApp/FuncApp/ApiApp->column('uptime','app')`、`App::app_class($app,false,'version')`——TP5 `column()` 只取 uptime/app 两列、`app_class` 只返回 `config['version']`，**从不触及存放 AK/SK 的 `config` 列**；`certificate`(`Api.php:237-249`) 仅返回 `{url,v}`。既无 AK/SK，也无写原语。
+- **V6【Low】运行时文件 web 可直读（无条件）**：`runtime/`、`data/`（含 `data/files`、`data/images`）均无 `deny from all .htaccess`（对比 `data/program/.htaccess=deny`）；根 `.htaccess` 的 `!-f` 使已存在文件由 Apache 直接服务 → `runtime/log/<YYYYMM>/<DD>.log`（路径按日期可猜）可未认证读取。**但不含 AK/SK**：app 配置 `log.level=['error']`(`config.php:165`) 覆盖框架默认，SQL 在 `'sql'` 级被过滤、不入文件日志（`tp/.../db/Connection.php:973`），日志仅 error 行。（此 `.htaccess` 缺失也是 V4 webshell 可执行的同一根因。）
+
+### 逐条证伪（覆盖度）
+- **配置缓存文件**：`Config::cacheConfigList()` 把全量配置（含 translate/download_img 云存储 AK/SK）写入缓存键 `cache_config_all`；缓存驱动=`File`（`config.php`），文件落 `runtime/cache/<md5>.php`、路径可预测、runtime 无 `.htaccess`。**但** TP5 File 缓存 `set()` 前置 `"<?php\n//<expire>\n exit();?>\n"`(`tp/.../cache/driver/File.php:158`)，经 Apache+mod_php 执行即 `exit()` 返回空；raw 读又无未认证 LFR/`file://` 通道（`get_html` 以 HTTP200 判成功，file:// 被丢弃）→ **泄漏不成立**。
+- **运行时日志泄漏 config 写 SQL**：被 `log.level=['error']` 过滤（见 V6）→ 不成立。
+- **login-fail 限流缓存写 / encrypt_config 缓存写**：无条件但写入内容由服务端构建/随机、永不作为可信配置/密钥读回（仅作失败计数器 / 登录传输层临时 AES key）→ 非可利用写原语。
+- **login_history 自动登录 cookie 伪造**：`generate_key=md5(lower(username).':'.password_hash)`(`admin/model/User.php:124`) 需存储口令 hash；无任何无条件未认证点泄漏 user 表口令字段 → 不可伪造。
+- **proc_open_exec / swoole_server / collect_process 命令执行**：均被一次性缓存密钥（`\util\Funcs::uniqid()=md5(uniqid+microtime+rand)`，不可预测）或开关门禁，且无未认证点可写入这些密钥 → 不可达。
+- **authsign 绕过后的 addon 安装写路径**：在登录门之后 → 非无条件。
+- **未认证 SQLi**（login/find_password/`store_update` 的 `$storeAddons`）：参数化 / `column()` 投影 / IN 绑定 → 读不到 config/user。
+
+### realistic 最大未认证影响（非无条件，但真实部署常见）
+V4（未认证→RCE→**全部永久凭据**，含云 AK/SK）与 V1（未认证→SSRF→临时 STS）在**启用了"单页采集"及"文件本地化+发布"功能的实例**上成立——这是使用该采集器的常见运营配置，但不是零配置/无条件。要把它们升级为真正无条件，需要一个当前**未发现**的无条件未认证写原语（自建任务/翻开 download_file）。
 
 ---
 

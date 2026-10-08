@@ -135,3 +135,24 @@
 ## 定级修正
 - 头号漏洞由 V1(临时STS) 升级为 **V4(持久化RCE→永久凭据)**。V1 降为并列Critical但影响短效。
 - 注: 第二轮对抗验证阶段因会话速率限制中断(34 agent失败), "待复验"项为finder已完成、我已核对关键断言但未独立对抗复核者; V4 已完成3/3验证+实弹。
+
+---
+# 第三轮审计（Workflow, 3 维度）—— 目标: 无条件(默认全新安装)未认证泄漏云AK/SK
+
+## 结论: ✗ 不存在无条件未认证云AK/SK泄漏（已穷举证伪）
+默认安装仅种 config 的 version/caiji/site，无任何 task/dataapi/云凭据配置。所有"无条件"未认证原语均为无害死胡同；所有能触及 AK/SK 的路径都需运营者预置(V1/V4的单页采集任务、store插件表导入、或登录)。
+
+### 本轮新确认的【无条件未认证】原语（但不泄漏AK/SK）
+- **V5 [Medium] authsign 鉴权绕过（无条件）**: admin/api store_update / certificate 依赖 Provider::storeAuthResult(Provider.php:150)。全新安装 store 密钥空→getAuthkey(null)=''(Provider.php:74-87)→createAuthsign(Provider.php:102)各分量(authkey=''/client_domain=Host头/store_domain=攻击者/timestamp)全可伪造; store_url=https://www.skycaiji.com 过 is_official_url(allow_origins, config.php:253); timestamp 需 now±1000s。→ 未认证绕过成立(provider_id=0)。**但解锁的 store_update/certificate 仅回显 url/version/uptime**: column('uptime','app')/app_class(...,'version') 投影不含 config 列(Api.php:262-298, App.php:69) → 无AK/SK、无写原语。
+- **V6 [Low] 运行时文件 web 可直读**: runtime/、data/ 无 deny .htaccess(对比 data/program/.htaccess=deny)，根 .htaccess `!-f` 使已存在文件直接由 Apache 服务。→ runtime/log/<YYYYMM>/<DD>.log(路径按日期可猜)可未认证读。**但不含AK/SK**: app 配置 log.level=['error'](config.php:165)覆盖默认→SQL('sql'级)被过滤不入日志(Connection.php:973)，仅error行。
+
+### 已证伪的候选（覆盖度）
+- 配置缓存文件 runtime/cache/<md5('cache_config_all')>.php 明文含全量机密(含云AK/SK)且路径可预测——但 TP5 File 缓存前置 `<?php ...exit();?>`(cache/driver/File.php:158)，web 执行返回空；无未认证 raw/LFR 读通道 → ✗。
+- login-fail 限流缓存写(sky_cache_login)、encrypt_config 缓存写: 无条件但内容服务端构建/随机，永不作为可信配置读回 → ✗ 写原语。
+- login_history 自动登录 cookie: generate_key=md5(username:password_hash) 需存储口令hash，无任何无条件点泄漏之 → ✗ 伪造。
+- proc_open_exec/swoole_server/collect_process 命令执行: 均 cache-key/开关门禁，密钥 md5(uniqid+microtime+rand) 不可预测且无未认证写入点 → ✗。
+- authsign 绕过后的 addon 安装写路径在登录门后 → ✗ 无条件。
+- 未认证 SQLi(login/find_password/store_update $storeAddons): 参数化/column投影/IN绑定 → ✗。
+
+### realistic 最大未认证影响(非无条件, 但真实部署常见)
+- V4(RCE→全部永久凭据) 与 V1(SSRF→临时STS): 需运营者启用"单页采集"(V1)及"文件本地化+发布"(V4)的任务——这是使用该采集器的常见配置，但不是零配置。
